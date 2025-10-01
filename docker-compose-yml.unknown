@@ -1,0 +1,187 @@
+services:
+  # Zookeeper - Coordination pour Kafka et HBase
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      - ZOOKEEPER_CLIENT_PORT=2181
+      - ZOOKEEPER_TICK_TIME=2000
+    networks:
+      - datalake_network
+
+  # Kafka - Ingestion de données en streaming
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_BROKER_ID=1
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_CREATE_TOPICS=test:1:1
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - datalake_network
+
+  # NiFi - Ingestion unifiée de toutes les sources
+  nifi:
+    image: apache/nifi:latest
+    container_name: nifi
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    environment:
+      - NIFI_WEB_HTTP_PORT=8080
+      - NIFI_WEB_HTTPS_PORT=8443
+      - NIFI_WEB_HTTP_HOST=0.0.0.0
+      - NIFI_SECURITY_USER_AUTHENTICATION=SINGLE_USER
+      - NIFI_CLUSTER_IS_NODE=false
+      - NIFI_SENSITIVE_PROPS_KEY=nifikey123456
+      - SINGLE_USER_CREDENTIALS_USERNAME=admin
+      - SINGLE_USER_CREDENTIALS_PASSWORD=adminpassword
+    volumes:
+      - nifi_data:/opt/nifi/nifi-current/data
+      - nifi_logs:/opt/nifi/nifi-current/logs
+      - nifi_conf:/opt/nifi/nifi-current/conf
+      - ./input_data:/input_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/nifi"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - datalake_network
+
+  # NameNode - HDFS - serveur primaire
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    environment:
+      - CLUSTER_NAME=datalake
+    env_file:
+      - ./hadoop.env
+    volumes:
+      - namenode_data:/hadoop/dfs/name
+    networks:
+      - datalake_network
+
+  # DataNode - HDFS data storage
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    depends_on:
+      - namenode
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870
+    env_file:
+      - ./hadoop.env
+    volumes:
+      - datanode_data:/hadoop/dfs/data
+    networks:
+      - datalake_network
+
+  # HBase Master - Base de données NoSQL sur HDFS
+  hbase-master:
+    image: harisekhon/hbase:1.4
+    container_name: hbase-master
+    ports:
+      - "16000:16000"
+      - "16010:16010"
+    environment:
+      - HBASE_MANAGES_ZK=false
+      - HBASE_ZOOKEEPER_QUORUM=zookeeper
+    depends_on:
+      - zookeeper
+      - namenode
+    networks:
+      - datalake_network
+
+  # Spark Master - Pour le Delta Lake et le traitement des données
+  spark-master:
+    image: bitnami/spark:3.3.0
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    networks:
+      - datalake_network
+
+  # Spark Worker - Pour le traitement du delta lake avec hdfs
+  spark-worker:
+    image: bitnami/spark:3.3.0
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+      - namenode
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+      - SPARK_CONF_DIR=/opt/bitnami/spark/conf
+    command: >
+      bash -c "pip install delta-spark &&
+               echo 'spark.sql.extensions io.delta.sql.DeltaSparkSessionExtension' >> /opt/bitnami/spark/conf/spark-defaults.conf &&
+               echo 'spark.sql.catalog.spark_catalog org.apache.spark.sql.delta.catalog.DeltaCatalog' >> /opt/bitnami/spark/conf/spark-defaults.conf &&
+               echo 'spark.hadoop.fs.defaultFS hdfs://namenode:9000' >> /opt/bitnami/spark/conf/spark-defaults.conf &&
+               /opt/bitnami/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077"
+    volumes:
+      - spark_data:/opt/bitnami/spark/data
+    networks:
+      - datalake_network
+
+  # Spark Shell - Pour l'interraction avec le Delta Lake
+  spark-shell:
+    image: bitnami/spark:3.3.0
+    container_name: spark-shell
+    depends_on:
+      - spark-master
+      - namenode
+    environment:
+      - SPARK_MODE=client
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_CONF_DIR=/opt/bitnami/spark/conf
+    command: >
+      bash -c "pip install delta-spark &&
+               echo 'spark.sql.extensions io.delta.sql.DeltaSparkSessionExtension' >> /opt/bitnami/spark/conf/spark-defaults.conf &&
+               echo 'spark.sql.catalog.spark_catalog org.apache.spark.sql.delta.catalog.DeltaCatalog' >> /opt/bitnami/spark/conf/spark-defaults.conf &&
+               echo 'spark.hadoop.fs.defaultFS hdfs://namenode:9000' >> /opt/bitnami/spark/conf/spark-defaults.conf &&
+               /opt/bitnami/spark/bin/spark-shell --master spark://spark-master:7077 --packages io.delta:delta-core_2.12:2.3.0"
+    volumes:
+      - spark_data:/opt/bitnami/spark/data
+    networks:
+      - datalake_network
+
+networks:
+  datalake_network:
+    driver: bridge
+
+volumes:
+  kafka_data:
+  nifi_data:
+  nifi_logs:
+  nifi_conf:
+  namenode_data:
+  datanode_data:
+  spark_data:
